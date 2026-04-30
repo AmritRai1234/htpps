@@ -51,41 +51,101 @@ static char g_send_buf[SEND_BUF_SIZE];
 static char g_file_buf[FILE_BUF_SIZE];
 
 /*
- * handle_http_client — Plain HTTP with JIT'd syscalls
+ * RESPONSE CACHE — pre-built HTTP response for index.html.
+ * Built once at startup. For "/" requests we skip the entire
+ * router → fopen → fread → fclose → http_build pipeline
+ * and just send these cached bytes directly.
  *
- * Uses direct syscall instructions (fast_recv/fast_send/fast_close)
- * instead of libc wrappers — saves ~20ns per syscall by skipping
- * PLT/GOT indirection, errno handling, and signal mask checks.
+ * Extra RAM: ~4KB (the file is 3,352 bytes + ~150 bytes of headers).
+ * That's less than a single stack frame.
  */
-static void handle_http_client(int client_fd, const char *client_ip, const char *www_root)
+static char  g_cached_index[8192];   /* pre-built full response */
+static size_t g_cached_index_len;     /* length of cached response */
+
+static void cache_index_response(const char *www_root)
+{
+    char filepath[2048];
+    snprintf(filepath, sizeof(filepath), "%s/index.html", www_root);
+
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) {
+        g_cached_index_len = 0;
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (fsize <= 0 || (size_t)fsize > sizeof(g_cached_index) - 512) {
+        fclose(fp);
+        g_cached_index_len = 0;
+        return;
+    }
+
+    /* Build headers */
+    int hdr_len = snprintf(g_cached_index, sizeof(g_cached_index),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: close\r\n"
+        "\r\n", fsize);
+
+    /* Read body directly after headers */
+    size_t body_read = fread(g_cached_index + hdr_len, 1, (size_t)fsize, fp);
+    fclose(fp);
+
+    g_cached_index_len = (size_t)hdr_len + body_read;
+    printf("[CACHE] index.html: %zu bytes (hdr=%d body=%zu) — will serve from RAM\n",
+           g_cached_index_len, hdr_len, body_read);
+}
+
+/*
+ * handle_http_client — Plain HTTP with JIT'd syscalls + response cache
+ *
+ * For "/" requests: recv → parse → send cached response → close
+ * Skips: router, fopen, fread, fclose, http_build_response
+ * Eliminates 4 kernel syscalls and all string formatting per request.
+ */
+static void handle_http_client(int client_fd, const char *www_root)
 {
     size_t response_len = 0;
     int64_t bytes_received = 0;
 
-    /* Direct syscall: read → no libc overhead */
+    /* Direct syscall: read */
     bytes_received = fast_recv(client_fd, g_recv_buf, RECV_BUF_SIZE - 1);
     if (bytes_received <= 0) goto cleanup;
     g_recv_buf[bytes_received] = '\0';
 
     http_request_t req;
-    if (http_parse_request(g_recv_buf, (size_t)bytes_received, &req) < 0) {
-        goto cleanup;
+    if (http_parse_request(g_recv_buf, (size_t)bytes_received, &req) < 0) goto cleanup;
+
+    /*
+     * FAST PATH: if requesting "/" and we have it cached,
+     * skip the entire router/file/response pipeline.
+     * Just send the pre-built bytes. Zero disk I/O. Zero formatting.
+     */
+    if (g_cached_index_len > 0 && strcmp(req.path, "/") == 0) {
+        fast_send(client_fd, g_cached_index, g_cached_index_len);
+        /* Wipe only recv (cached response is read-only, never changes) */
+        if (bytes_received > 0)
+            memset(g_recv_buf, 0, (size_t)bytes_received + 1);
+        fast_close(client_fd);
+        return;
     }
 
+    /* NORMAL PATH: everything else goes through the router */
     http_response_t res;
+    memset(&res, 0, sizeof(res));
     router_handle_request(www_root, &req, &res, g_file_buf, FILE_BUF_SIZE);
 
     if (http_build_response(&res, g_send_buf, SEND_BUF_SIZE, &response_len) < 0) goto cleanup;
 
-    /* Direct syscall: write loop → no libc overhead */
     fast_send(client_fd, g_send_buf, response_len);
 
 cleanup:
     /*
      * SECURITY: Wipe ONLY the bytes we actually used.
-     * A typical request uses ~500 bytes recv + ~4KB send + ~4KB file.
-     * Instead of zeroing 1.6MB (expensive), we zero ~9KB (cheap).
-     * This prevents previous client data from leaking to the next client.
      */
     if (bytes_received > 0)
         memset(g_recv_buf, 0, (size_t)bytes_received + 1);
@@ -94,7 +154,6 @@ cleanup:
     if (res.body_len > 0)
         memset(g_file_buf, 0, (size_t)res.body_len);
 
-    /* Direct syscall: close → no libc overhead */
     fast_close(client_fd);
 }
 
@@ -213,8 +272,11 @@ int main(int argc, char *argv[])
     /* Detect and enable hardware crypto acceleration */
     crypto_fast_init();
 
+    /* Cache index.html response in RAM (~4KB) */
+    cache_index_response(www_root);
+
     printf("╔═══════════════════════════════════════════╗\n");
-    printf("║          ⚡ HTPPS Server                  ║\n");
+    printf("║          ⚡ HTPPS Server                   ║\n");
     printf("║   HTTPS from scratch — zero dependencies  ║\n");
     printf("╠═══════════════════════════════════════════╣\n");
     if (mode != 0) {
@@ -232,10 +294,13 @@ int main(int argc, char *argv[])
         if (server_fd < 0) return 1;
 
         while (1) {
-            char client_ip[64] = {0};
-            int client_fd = tcp_accept(server_fd, client_ip, sizeof(client_ip));
+            /*
+             * fast_accept: direct syscall, skip inet_ntop IP formatting
+             * we removed logging, so we don't need the IP string.
+             */
+            int client_fd = fast_accept(server_fd, NULL, NULL);
             if (client_fd < 0) continue;
-            handle_http_client(client_fd, client_ip, www_root);
+            handle_http_client(client_fd, www_root);
         }
     } else {
         /* HTTPS (with optional HTTP) */
