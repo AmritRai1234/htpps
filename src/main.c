@@ -59,8 +59,11 @@ static char g_file_buf[FILE_BUF_SIZE];
  */
 static void handle_http_client(int client_fd, const char *client_ip, const char *www_root)
 {
+    size_t response_len = 0;
+    int64_t bytes_received = 0;
+
     /* Direct syscall: read → no libc overhead */
-    int64_t bytes_received = fast_recv(client_fd, g_recv_buf, RECV_BUF_SIZE - 1);
+    bytes_received = fast_recv(client_fd, g_recv_buf, RECV_BUF_SIZE - 1);
     if (bytes_received <= 0) goto cleanup;
     g_recv_buf[bytes_received] = '\0';
 
@@ -72,13 +75,25 @@ static void handle_http_client(int client_fd, const char *client_ip, const char 
     http_response_t res;
     router_handle_request(www_root, &req, &res, g_file_buf, FILE_BUF_SIZE);
 
-    size_t response_len;
     if (http_build_response(&res, g_send_buf, SEND_BUF_SIZE, &response_len) < 0) goto cleanup;
 
     /* Direct syscall: write loop → no libc overhead */
     fast_send(client_fd, g_send_buf, response_len);
 
 cleanup:
+    /*
+     * SECURITY: Wipe ONLY the bytes we actually used.
+     * A typical request uses ~500 bytes recv + ~4KB send + ~4KB file.
+     * Instead of zeroing 1.6MB (expensive), we zero ~9KB (cheap).
+     * This prevents previous client data from leaking to the next client.
+     */
+    if (bytes_received > 0)
+        memset(g_recv_buf, 0, (size_t)bytes_received + 1);
+    if (response_len > 0)
+        memset(g_send_buf, 0, response_len);
+    if (res.body_len > 0)
+        memset(g_file_buf, 0, (size_t)res.body_len);
+
     /* Direct syscall: close → no libc overhead */
     fast_close(client_fd);
 }
